@@ -117,38 +117,35 @@ struct force_calculation_wf {
     auto first = dom.first();
     auto last  = dom.last();
     double cutoff_sq = m_cutoff * m_cutoff;
-    
-    // vector<particle_position_t> positions(num_particles);
-    // for (size_t i = 0; i < num_particles; i++) {
-    //   positions[i] = positions_view[i];
-    // }
 
     // Fill the forces output
     vector<force_vector_t> forces(dom.size(), {0.0, 0.0, 0.0});
     
     // Calculate all pairwise forces
     for (auto i = first; i <= last; i++) {
+      auto off_i = i - first;
       particle_position_t pos_i = positions_view[i];
       for (auto j = i+1; j<=last; j++) {
+        auto off_j = j - first;
         particle_position_t pos_j = positions_view[j];
         
         force_vector_t f = calculate_lj_force(pos_i, pos_j, 
                         m_sigma, m_epsilon, cutoff_sq, m_dim_x, m_dim_y, m_dim_z);
         
         // Apply Newton's third law: equal and opposite forces
-        forces[i].x += f.x;
-        forces[i].y += f.y;
-        forces[i].z += f.z;
+        forces[off_i].x += f.x;
+        forces[off_i].y += f.y;
+        forces[off_i].z += f.z;
         
-        forces[j].x -= f.x;
-        forces[j].y -= f.y;
-        forces[j].z -= f.z;
+        forces[off_j].x -= f.x;
+        forces[off_j].y -= f.y;
+        forces[off_j].z -= f.z;
       }
     }
 
     // Copy forces to the output
     for (auto i = first; i <= last; i++) {
-      forces_output[i] = forces[i-dom.first()];
+      forces_output[i] = forces[i-first];
     }
   }
   
@@ -495,7 +492,7 @@ stapl::exit_code stapl_main(int argc, char *argv[]) {
     }
     
     // Optional: Calculate and report energy at intervals
-    if (step % 100 == 0) {
+    if (step % 10 == 0) {
       double energy =
           stapl::map_reduce<stapl::skeletons::tags::with_coarsened_wf>(
               energy_calculation_wf(sigma, epsilon, cutoff, mass, velocities, dim_x, dim_y, dim_z),
