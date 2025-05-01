@@ -112,22 +112,27 @@ struct force_calculation_wf {
         m_dim_x(dim_x), m_dim_y(dim_y), m_dim_z(dim_z) {}
   
   template <typename P, typename F>
-  vector<force_vector_t> operator()(P &&positions_view, F &&forces_output) {
-    size_t num_particles = positions_view.size();
+  void operator()(P &&positions_view, F &&forces_output) {
+    auto dom = positions_view.domain();   // yields the local index range
+    auto first = dom.first();
+    auto last  = dom.last();
     double cutoff_sq = m_cutoff * m_cutoff;
     
     // vector<particle_position_t> positions(num_particles);
-    // for (size_t i = 0; i < num_particles; ++i) {
+    // for (size_t i = 0; i < num_particles; i++) {
     //   positions[i] = positions_view[i];
     // }
 
     // Fill the forces output
-    vector<force_vector_t> forces(num_particles, {0.0, 0.0, 0.0});
+    vector<force_vector_t> forces(dom.size(), {0.0, 0.0, 0.0});
     
     // Calculate all pairwise forces
-    for (size_t i = 0; i < num_particles; ++i) {
-      for (size_t j = i + 1; j < num_particles; ++j) {
-        force_vector_t f = calculate_lj_force(positions_view[i], positions_view[j], 
+    for (auto i = first; i <= last; i++) {
+      particle_position_t pos_i = positions_view[i];
+      for (auto j = i+1; j<=last; j++) {
+        particle_position_t pos_j = positions_view[j];
+        
+        force_vector_t f = calculate_lj_force(pos_i, pos_j, 
                         m_sigma, m_epsilon, cutoff_sq, m_dim_x, m_dim_y, m_dim_z);
         
         // Apply Newton's third law: equal and opposite forces
@@ -142,8 +147,8 @@ struct force_calculation_wf {
     }
 
     // Copy forces to the output
-    for (size_t i = 0; i < num_particles; ++i) {
-      forces_output[i] = forces[i];
+    for (auto i = first; i <= last; i++) {
+      forces_output[i] = forces[i-dom.first()];
     }
   }
   
@@ -171,36 +176,36 @@ struct velocity_verlet_wf {
       m_dim_x(dim_x), m_dim_y(dim_y), m_dim_z(dim_z) {}
   
   template <typename P, typename F, typename O>
-  vector<particle_position_t> operator()(P &&positions_view, F &&forces_view, O &&new_positions_output) {
-    size_t num_particles = positions_view.size();
-    vector<particle_position_t> new_positions(num_particles);
+  void operator()(P &&positions_view, F &&forces_view, O &&new_positions_output) {
+    auto dom = positions_view.domain();   // yields the local index range
+    auto first = dom.first();
+    auto last  = dom.last();
     
     // Update positions and velocities using velocity-Verlet algorithm
-    for (size_t i = 0; i < num_particles; ++i) {
+    for (auto i = first; i <= last; i++) {
       // Get the base data through the proxy
       particle_position_t pos_val = static_cast<particle_position_t>(positions_view[i]);
       force_vector_t force_val = static_cast<force_vector_t>(forces_view[i]);
       
       // Position update
-      new_positions[i].x = pos_val.x + m_velocities[i].x * m_timestep + 
+      particle_position_t new_position;
+      new_position.x = pos_val.x + m_velocities[i].x * m_timestep + 
                           0.5 * force_val.x / m_mass * m_timestep * m_timestep;
-      new_positions[i].y = pos_val.y + m_velocities[i].y * m_timestep + 
+      new_position.y = pos_val.y + m_velocities[i].y * m_timestep + 
                           0.5 * force_val.y / m_mass * m_timestep * m_timestep;
-      new_positions[i].z = pos_val.z + m_velocities[i].z * m_timestep + 
+      new_position.z = pos_val.z + m_velocities[i].z * m_timestep + 
                           0.5 * force_val.z / m_mass * m_timestep * m_timestep;
       
       // Apply periodic boundary conditions
-      apply_pbc(new_positions[i], m_dim_x, m_dim_y, m_dim_z);
+      apply_pbc(new_position, m_dim_x, m_dim_y, m_dim_z);
+
+      // Update the output
+      new_positions_output[i] = new_position;
 
       // Velocity half-update
       m_velocities[i].x += 0.5 * force_val.x / m_mass * m_timestep;
       m_velocities[i].y += 0.5 * force_val.y / m_mass * m_timestep;
       m_velocities[i].z += 0.5 * force_val.z / m_mass * m_timestep;
-    }
-
-    // Copy to output
-    for (size_t i = 0; i < num_particles; ++i) {
-      new_positions_output[i] = new_positions[i];
     }
   }
   
@@ -221,31 +226,45 @@ struct energy_calculation_wf {
   double m_epsilon;
   double m_cutoff;
   double m_mass;
+  double m_dim_x, m_dim_y, m_dim_z;
   vector<particle_velocity_t> m_velocities;
   
   energy_calculation_wf(double sigma, double epsilon, double cutoff, 
-                       double mass, vector<particle_velocity_t> &velocities)
+                       double mass, vector<particle_velocity_t> &velocities, 
+                       double dim_x, double dim_y, double dim_z)
     : m_sigma(sigma), m_epsilon(epsilon), m_cutoff(cutoff), 
-      m_mass(mass), m_velocities(velocities) {}
+      m_mass(mass), m_velocities(velocities),
+      m_dim_x(dim_x), m_dim_y(dim_y), m_dim_z(dim_z) {}
   
   template <typename T>
   double operator()(T &&positions_view) {
-    size_t num_particles = positions_view.size();
+    auto dom   = positions_view.domain();
+    auto first = dom.first();
+    auto last  = dom.last();
+
     double potential_energy = 0.0;
     double kinetic_energy = 0.0;
     double cutoff_sq = m_cutoff * m_cutoff;
     
-    vector<particle_position_t> positions(num_particles);
-    for (size_t i = 0; i < num_particles; ++i) {
-      positions[i] = positions_view[i];
-    }
+    // vector<particle_position_t> positions(num_particles);
+    // for (size_t i = 0; i < num_particles; i++) {
+    //   positions[i] = positions_view[i];
+    // }
     
     // Calculate potential energy (LJ potential)
-    for (size_t i = 0; i < num_particles; ++i) {
-      for (size_t j = i + 1; j < num_particles; ++j) {
-        double dx = positions[i].x - positions[j].x;
-        double dy = positions[i].y - positions[j].y;
-        double dz = positions[i].z - positions[j].z;
+    for (auto i = first; i <= last; i++) {
+      particle_position_t pos_i = positions_view[i];
+      for (auto j = i+1; j<=last; j++) {
+        particle_position_t pos_j = positions_view[j];
+
+        double dx = pos_i.x - pos_j.x;
+        double dy = pos_i.y - pos_j.y;
+        double dz = pos_i.z - pos_j.z;
+
+        // Apply minimum image convention
+        dx -= m_dim_x * round(dx / m_dim_x);
+        dy -= m_dim_y * round(dy / m_dim_y);
+        dz -= m_dim_z * round(dz / m_dim_z);
         
         double r_squared = dx*dx + dy*dy + dz*dz;
         
@@ -277,6 +296,9 @@ struct energy_calculation_wf {
     t.member(m_cutoff);
     t.member(m_mass);
     t.member(m_velocities);
+    t.member(m_dim_x);
+    t.member(m_dim_y);
+    t.member(m_dim_z);
   }
 };
 
@@ -424,7 +446,7 @@ stapl::exit_code stapl_main(int argc, char *argv[]) {
   stapl::array_view<stapl::array<force_vector_t>> forces_view(forces_array);
   
   // Copy initial positions to STAPL container
-  for (size_t i = 0; i < num_particles; ++i) {
+  for (size_t i = 0; i < num_particles; i++) {
     positions_array[i] = positions[i];
   }
   
@@ -434,7 +456,7 @@ stapl::exit_code stapl_main(int argc, char *argv[]) {
   timer.reset();
   timer.start();
   
-  for (size_t step = 0; step < num_timesteps; ++step) {
+  for (size_t step = 0; step < num_timesteps; step++) {
     // Calculate forces
     stapl::map_func<stapl::skeletons::tags::with_coarsened_wf>(
             force_calculation_wf(sigma, epsilon, cutoff, dim_x, dim_y, dim_z),
@@ -449,7 +471,7 @@ stapl::exit_code stapl_main(int argc, char *argv[]) {
             new_positions_view);
     
     // Copy new positions to positions array
-    for (size_t i = 0; i < num_particles; ++i) {
+    for (size_t i = 0; i < num_particles; i++) {
       positions_array[i] = new_positions_array[i];
     }
     
@@ -461,12 +483,12 @@ stapl::exit_code stapl_main(int argc, char *argv[]) {
 
     // Get forces for the velocity update
     vector<force_vector_t> new_forces(num_particles);
-    for (size_t i = 0; i < num_particles; ++i) {
+    for (size_t i = 0; i < num_particles; i++) {
       new_forces[i] = forces_array[i];
     }
     
     // Complete velocity update
-    for (size_t i = 0; i < num_particles; ++i) {
+    for (size_t i = 0; i < num_particles; i++) {
       velocities[i].x += 0.5 * new_forces[i].x / mass * timestep;
       velocities[i].y += 0.5 * new_forces[i].y / mass * timestep;
       velocities[i].z += 0.5 * new_forces[i].z / mass * timestep;
@@ -476,7 +498,7 @@ stapl::exit_code stapl_main(int argc, char *argv[]) {
     if (step % 100 == 0) {
       double energy =
           stapl::map_reduce<stapl::skeletons::tags::with_coarsened_wf>(
-              energy_calculation_wf(sigma, epsilon, cutoff, mass, velocities),
+              energy_calculation_wf(sigma, epsilon, cutoff, mass, velocities, dim_x, dim_y, dim_z),
               std::plus<double>(),
               positions_view);
       
