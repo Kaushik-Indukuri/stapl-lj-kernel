@@ -42,15 +42,6 @@ typedef struct {
   }
 } particle_velocity_t;
 
-struct LJSimulation {
-  double best_energy;
-  double temperature;
-  
-  void define_type(stapl::typer &t) {
-    t.member(best_energy);
-    t.member(temperature);
-  }
-};
 
 // Apply periodic boundary conditions
 void apply_pbc(particle_position_t& pos, double dim_x, double dim_y, double dim_z) {
@@ -60,55 +51,17 @@ void apply_pbc(particle_position_t& pos, double dim_x, double dim_y, double dim_
 }
 
 
-// Calculate Lennard-Jones force between two particles
-force_vector_t calculate_lj_force(particle_position_t p1, particle_position_t p2, 
-  double sigma, double epsilon, double cutoff_sq, double dim_x, double dim_y, double dim_z) {
-  force_vector_t force = {0.0, 0.0, 0.0};
-
-  // Calculate distance vector
-  double dx = p1.x - p2.x;
-  double dy = p1.y - p2.y;
-  double dz = p1.z - p2.z;
-
-  // Apply minimum image convention
-  dx -= dim_x * round(dx / dim_x);
-  dy -= dim_y * round(dy / dim_y);
-  dz -= dim_z * round(dz / dim_z);
-
-  // Calculate squared distance
-  double r_squared = dx*dx + dy*dy + dz*dz;
-
-  // Apply force only if particles are within cutoff
-  if (r_squared < cutoff_sq && r_squared > 0.0) {
-    double inv_r2 = 1.0 / r_squared;
-    double inv_r6 = inv_r2 * inv_r2 * inv_r2;
-    double inv_r12 = inv_r6 * inv_r6;
-
-    // LJ force magnitude: 24ε[(2σ¹²/r¹²) - (σ⁶/r⁶)]/r²
-    double force_magnitude = 24.0 * epsilon * 
-    (2.0 * pow(sigma, 12) * inv_r12 - 
-    pow(sigma, 6) * inv_r6) * inv_r2;
-
-    // Apply direction
-    force.x = force_magnitude * dx;
-    force.y = force_magnitude * dy;
-    force.z = force_magnitude * dz;
-  }
-
-  return force;
-}
-
-
 // Functor for calculating forces in parallel
 struct force_calculation_wf {
-  double m_sigma;
+  double m_sigma6;
+  double m_sigma12;
   double m_epsilon;
-  double m_cutoff;
+  double m_cutoff_sq;
   double m_dim_x, m_dim_y, m_dim_z;
   
-  force_calculation_wf(double sigma, double epsilon, double cutoff,
+  force_calculation_wf(double sigma6, double sigma12, double epsilon, double cutoff_sq,
                       double dim_x, double dim_y, double dim_z)
-      : m_sigma(sigma), m_epsilon(epsilon), m_cutoff(cutoff),
+      : m_sigma6(sigma6), m_sigma12(sigma12), m_epsilon(epsilon), m_cutoff_sq(cutoff_sq),
         m_dim_x(dim_x), m_dim_y(dim_y), m_dim_z(dim_z) {}
   
   template <typename P, typename F>
@@ -116,30 +69,59 @@ struct force_calculation_wf {
     auto dom = positions_view.domain();   // yields the local index range
     auto first = dom.first();
     auto last  = dom.last();
-    double cutoff_sq = m_cutoff * m_cutoff;
+    auto n = dom.size();
+
+    vector<particle_position_t> local_pos(n);
+    for (auto i = first; i <= last; i++)
+      local_pos[i - first] = positions_view[i];
 
     // Fill the forces output
-    vector<force_vector_t> forces(dom.size(), {0.0, 0.0, 0.0});
+    vector<force_vector_t> forces(n, {0.0, 0.0, 0.0});
     
     // Calculate all pairwise forces
-    for (auto i = first; i <= last; i++) {
-      auto off_i = i - first;
-      particle_position_t pos_i = positions_view[i];
-      for (auto j = i+1; j<=last; j++) {
-        auto off_j = j - first;
-        particle_position_t pos_j = positions_view[j];
-        
-        force_vector_t f = calculate_lj_force(pos_i, pos_j, 
-                        m_sigma, m_epsilon, cutoff_sq, m_dim_x, m_dim_y, m_dim_z);
+    for (size_t i = 0; i < n; i++) {
+      particle_position_t &p1 = local_pos[i];
+      for (size_t j = i+1; j < n; j++) {
+        particle_position_t &p2 = local_pos[j];
+
+        // Calculate distance vector
+        double dx = p1.x - p2.x;
+        double dy = p1.y - p2.y;
+        double dz = p1.z - p2.z;
+
+        // Apply minimum image convention
+        dx -= m_dim_x * round(dx / m_dim_x);
+        dy -= m_dim_y * round(dy / m_dim_y);
+        dz -= m_dim_z * round(dz / m_dim_z);
+
+        // Calculate squared distance
+        double r_squared = dx*dx + dy*dy + dz*dz;
+
+        // Apply force only if particles are within cutoff
+        if (r_squared <= 0.0 || r_squared >= m_cutoff_sq) continue; 
+
+        double inv_r2 = 1.0 / r_squared;
+        double inv_r6 = inv_r2 * inv_r2 * inv_r2;
+        double inv_r12 = inv_r6 * inv_r6;
+
+        // LJ force magnitude: 24ε[(2σ¹²/r¹²) - (σ⁶/r⁶)]/r²
+        double force_magnitude = 24.0 * m_epsilon * 
+        (2.0 * m_sigma12 * inv_r12 - 
+        m_sigma6 * inv_r6) * inv_r2;
+
+        // Apply direction
+        double fx = force_magnitude * dx;
+        double fy = force_magnitude * dy;
+        double fz = force_magnitude * dz;
         
         // Apply Newton's third law: equal and opposite forces
-        forces[off_i].x += f.x;
-        forces[off_i].y += f.y;
-        forces[off_i].z += f.z;
+        forces[i].x += fx;
+        forces[i].y += fy;
+        forces[i].z += fz;
         
-        forces[off_j].x -= f.x;
-        forces[off_j].y -= f.y;
-        forces[off_j].z -= f.z;
+        forces[j].x -= fx;
+        forces[j].y -= fy;
+        forces[j].z -= fz;
       }
     }
 
@@ -150,9 +132,10 @@ struct force_calculation_wf {
   }
   
   void define_type(stapl::typer &t) {
-    t.member(m_sigma);
+    t.member(m_sigma6);
+    t.member(m_sigma12);
     t.member(m_epsilon);
-    t.member(m_cutoff);
+    t.member(m_cutoff_sq);
     t.member(m_dim_x);
     t.member(m_dim_y);
     t.member(m_dim_z);
@@ -243,10 +226,6 @@ struct energy_calculation_wf {
     double kinetic_energy = 0.0;
     double cutoff_sq = m_cutoff * m_cutoff;
     
-    // vector<particle_position_t> positions(num_particles);
-    // for (size_t i = 0; i < num_particles; i++) {
-    //   positions[i] = positions_view[i];
-    // }
     
     // Calculate potential energy (LJ potential)
     for (auto i = first; i <= last; i++) {
@@ -269,11 +248,13 @@ struct energy_calculation_wf {
           double r_sq_inv = 1.0 / r_squared;
           double r_6_inv = r_sq_inv * r_sq_inv * r_sq_inv;
           double r_12_inv = r_6_inv * r_6_inv;
+          double sigma_6 = m_sigma * m_sigma * m_sigma * m_sigma * m_sigma * m_sigma;
+          double sigma_12 = sigma_6 * sigma_6;
           
           // LJ potential: 4ε[(σ/r)¹² - (σ/r)⁶]
           potential_energy += 4.0 * m_epsilon * 
-                             (pow(m_sigma, 12) * r_12_inv - 
-                              pow(m_sigma, 6) * r_6_inv);
+                             (sigma_12 * r_12_inv - 
+                              sigma_6 * r_6_inv);
         }
       }
       
@@ -448,15 +429,17 @@ stapl::exit_code stapl_main(int argc, char *argv[]) {
   }
   
   std::vector<double> execution_times(num_timesteps, 0.0);
+  double sigma6 = sigma * sigma * sigma * sigma * sigma * sigma;
+  double sigma12 = sigma6 * sigma6;
+  double cutoff_sq = cutoff * cutoff;
   
   // Main simulation loop
   timer.reset();
   timer.start();
-  
   for (size_t step = 0; step < num_timesteps; step++) {
     // Calculate forces
     stapl::map_func<stapl::skeletons::tags::with_coarsened_wf>(
-            force_calculation_wf(sigma, epsilon, cutoff, dim_x, dim_y, dim_z),
+            force_calculation_wf(sigma6, sigma12, epsilon, cutoff_sq, dim_x, dim_y, dim_z),
             positions_view,
             forces_view);
     
@@ -474,7 +457,7 @@ stapl::exit_code stapl_main(int argc, char *argv[]) {
     
     // Recalculate forces at new positions
     stapl::map_func<stapl::skeletons::tags::with_coarsened_wf>(
-            force_calculation_wf(sigma, epsilon, cutoff, dim_x, dim_y, dim_z),
+            force_calculation_wf(sigma6, sigma12, epsilon, cutoff_sq, dim_x, dim_y, dim_z),
             positions_view,
             forces_view);
 
@@ -492,7 +475,7 @@ stapl::exit_code stapl_main(int argc, char *argv[]) {
     }
     
     // Optional: Calculate and report energy at intervals
-    if (step % 10 == 0) {
+    if (step % 100 == 0) {
       double energy =
           stapl::map_reduce<stapl::skeletons::tags::with_coarsened_wf>(
               energy_calculation_wf(sigma, epsilon, cutoff, mass, velocities, dim_x, dim_y, dim_z),
@@ -511,6 +494,9 @@ stapl::exit_code stapl_main(int argc, char *argv[]) {
   
   // Report timing results
   report_result("Lennard-Jones MD", "STAPL", true, execution_times);
+  double total = std::accumulate(execution_times.begin(),
+                               execution_times.end(), 0.0);
+  std::cout << "Total sim time: " << total << " s\n";
   
 
   return EXIT_SUCCESS;
